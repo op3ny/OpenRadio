@@ -50,8 +50,11 @@ pip install requests beautifulsoup4 --break-system-packages
 4° Baixe o script e execute!
 
 ## Exemplo de uso
+
+- Configurações (Linhas: de 145 a 222)
+
 ```
-python3 index.py --rtmp "rtmp://servidor-rtmp-coloca-o-seu-aqui.exemplo/exemplo/chave" --query "Banda tal"
+python3 index.py
 ```
 
 
