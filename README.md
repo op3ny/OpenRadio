@@ -51,7 +51,7 @@ pip install requests beautifulsoup4 --break-system-packages
 
 ## Exemplo de uso
 
-- Configurações (Linhas: de 145 a 222)
+- Configurações (Linhas: de 145 a 234)
 
 ```
 python3 index.py
