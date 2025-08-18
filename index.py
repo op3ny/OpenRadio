@@ -2,15 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-OpenRadio Radio Player (v2.0.0)
+HSYST Radio Player - Ultra-Optimized Low-Resource Edition (v8.6.0)
 ------------------------------------------------------------
-- Fixed undefined 'limitself' error in track filters generation
-- Removed search limit for SoundCloud queries
-- Enforced 20-second delay between SoundCloud requests
-- Ensured continuous streaming with aggressive queue refilling
-- Fixed stalling by improving buffer and stream loop logic
-- Added detailed logging for queue and streaming issues
-- Maintained original optimizations with enhanced reliability
+- Complete rewrite of search system with better error handling
+- Added multiple fallback methods for track discovery
+- Improved network resilience with retry strategies
+- Better timeout handling for all operations
+- Enhanced logging for troubleshooting
 """
 
 import os
@@ -29,35 +27,37 @@ from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from enum import Enum, auto
 from bs4 import BeautifulSoup
-from typing import List, Dict, Optional, Deque, Any, Set
+from typing import List, Dict, Optional, Deque, Any, Set, Tuple
 from dataclasses import dataclass, asdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 
 # Constants
-VERSION = "8.4.9 Ultra-Optimized"
+VERSION = "8.6.0 Ultra-Resilient"
 DEFAULT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 BUFFER_CHECK_INTERVAL = 0.5
 TRANSITION_DURATION = 3
 MIN_BUFFER_SIZE = 1
-MAX_QUEUE_SIZE = 5 
+MAX_QUEUE_SIZE = 5
 STREAM_TIMEOUT = 30
 PRELOAD_WORKERS = 2
 FFMPEG_MONITOR_INTERVAL = 0.5
 FFMPEG_RESTART_DELAY = 0
 PLAYBACK_END_MARGIN = 5
 DISCLAIMER_DURATION = 5
-CONTROL_PIPE = "/tmp/openradio_control_pipe"
+CONTROL_PIPE = "/tmp/hsyst_control_pipe"
 CONTROL_COMMANDS = {"pause", "resume", "skip", "shutdown", "volume_up", "volume_down"}
+SEARCH_TIMEOUT = 20  # Timeout for search operations (seconds)
+NETWORK_RETRY_DELAY = 5  # Delay between network retries
 
 # Setup logging
 def setup_logging(base_dir: str) -> logging.Logger:
     log_dir = os.path.join(base_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
 
-    logger = logging.getLogger("OPENRadio")
+    logger = logging.getLogger("HSYSTRadio")
     logger.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter(
@@ -65,7 +65,7 @@ def setup_logging(base_dir: str) -> logging.Logger:
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    main_log = os.path.join(log_dir, "open_radio.log")
+    main_log = os.path.join(log_dir, "hsyst_radio.log")
     file_handler = logging.FileHandler(main_log)
     file_handler.setFormatter(formatter)
     file_handler.setLevel(logging.DEBUG)
@@ -91,7 +91,7 @@ class JsonLogger:
             with open(filepath, 'w') as f:
                 json.dump(data, f, indent=2, default=str)
         except Exception as e:
-            logging.getLogger("OPENRadio").error(f"Error writing JSON log: {e}")
+            logging.getLogger("HSYSTRadio").error(f"Error writing JSON log: {e}")
 
     def log_current_track(self, track: Dict) -> None:
         self._write_json_log("current_track.json", track)
@@ -148,11 +148,11 @@ DEFAULT_CONFIG = {
         "stats_file": "data/stats.json",
         "temp_dir": "temp",
         "cache_dir": "cache",
-        "max_history": 50,
+        "max_history": 20,
         "buffer_size": MIN_BUFFER_SIZE,
-        "max_cache_size": 5,  # Increased
+        "max_cache_size": 5,
         "track_buffer_size": MAX_QUEUE_SIZE,
-        "preload_ahead": 3,  # Increased for more slack
+        "preload_ahead": 3,
         "control_pipe": CONTROL_PIPE,
     },
     "stream": {
@@ -165,8 +165,8 @@ DEFAULT_CONFIG = {
         "preset": "veryfast",
         "threads": 2,
         "keyframe_interval": 60,
-        "rtmp_url": "rtmp://SUAURLRTMP",
-        "stream_key": "SUA-STREAM-KEY",
+        "rtmp_url": "rtmp://rtmp.livepub.hsyst.xyz/live",
+        "stream_key": "radio",
     },
     "player": {
         "min_duration": 120,
@@ -174,10 +174,10 @@ DEFAULT_CONFIG = {
         "max_consecutive_artists": 2,
         "artist_cooldown": 5,
         "track_cooldown": 30,
-        "retry_delay": 5,  # Reduced for faster retries
+        "retry_delay": 5,
         "min_buffer_size": MIN_BUFFER_SIZE,
-        "max_empty_retries": 20,  # Increased for resilience
-        "buffer_refill_threshold": 3,  # Refill if below 3
+        "max_empty_retries": -1,
+        "buffer_refill_threshold": 3,
         "ffmpeg_restart_delay": FFMPEG_RESTART_DELAY,
         "playback_end_margin": PLAYBACK_END_MARGIN,
         "disclaimer_duration": DISCLAIMER_DURATION,
@@ -196,28 +196,40 @@ DEFAULT_CONFIG = {
             "#FF1493", "#00CED1", "#FFD700"
         ],
         "font_file": "DejaVuSans-Bold.ttf",
-        "logo_text": "OPENRADIO",
+        "logo_text": "HSYST RADIO",
         "credits_text": "Criado por op3n",
         "live_indicator": "• AO VIVO •",
         "box_opacity": 0.7,
         "box_border": 5,
-        "disclaimer_text": "AVISO LEGAL\nEste conteúdo é protegido por direitos autorais.\nA transmissão é realizada apenas para fins educativos e de entretenimento.\nTodo o conteúdo audiovisual é de fontes públicas\nOPEN Rádio não armazena ou reproduz conteúdo de forma ilegal.",
+        "disclaimer_text": "AVISO LEGAL\nEste conteúdo é protegido por direitos autorais.\nA transmissão é realizada apenas para fins educativos e de entretenimento.\nTodo o conteúdo audiovisual é de fontes públicas\nHSYST Rádio não armazena ou reproduz conteúdo de forma ilegal.",
     },
     "search": {
-        "max_results": 50,  # Increased to handle more results
+        "max_results": 50,
         "backoff_factor": 2,
         "max_retries": 3,
         "user_agent": DEFAULT_USER_AGENT,
         "search_url": "https://soundcloud.com/search/sounds?q=",
         "timeout": 30,
         "download_timeout": 200,
-        "request_delay": 20.0,  # Fixed 20s delay
-        "max_consecutive_failures": 5,  # Increased
+        "request_delay": 20.0,
+        "max_consecutive_failures": 10,
     },
     "queries": [
-        "Chico Buarque",
-        "Os Paralamas do Sucesso",
-        "Mato Seco"
+        "Artista1",
+        "Artista2",
+        "Artista3",
+        "Artista4",
+        "Artista5",
+        "Artista6",
+        "etc..."
+    ],
+    "fallback_queries": [
+        "Brazilian music",
+        "MPB",
+        "Rock brasileiro",
+        "Sertanejo",
+        "Forró",
+        "Samba"
     ]
 }
 
@@ -360,6 +372,13 @@ class TrackManager:
         with self.lock:
             return self.title_stats.get(normalized, 0) > 0
 
+    def reset_history(self) -> None:
+        """Reset the play history to allow previously played tracks to be played again"""
+        with self.lock:
+            self.played_tracks.clear()
+            self.last_artists.clear()
+        self.logger.warning("Play history has been reset to expand search results")
+
     def cleanup_cache(self) -> None:
         cache_dir = self.config["system"]["cache_dir"]
         os.makedirs(cache_dir, exist_ok=True)
@@ -397,11 +416,15 @@ class SoundCloudAPI:
         self.request_history = deque(maxlen=50)
         self.user_agents = self._generate_user_agents()
         self.current_agent_index = 0
+        self.network_retries = 0
+        self.max_network_retries = 5
 
     def _generate_user_agents(self) -> List[str]:
         return [
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Safari/605.1.15",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 14_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1"
         ]
 
     def _normalize_title(self, title: str) -> str:
@@ -432,53 +455,83 @@ class SoundCloudAPI:
             time.sleep(wait_time)
         self.last_request_time = time.time()
 
-    def search_tracks(self, query: str) -> List[str]:
-        self.logger.debug(f"Searching for: {query} (no limit)")
-        self.current_query = query
+    def _check_network_connection(self) -> bool:
+        try:
+            response = requests.get("https://www.google.com", timeout=5)
+            return response.status_code == 200
+        except:
+            return False
 
+    def _handle_network_error(self) -> bool:
+        self.network_retries += 1
+        if self.network_retries >= self.max_network_retries:
+            self.logger.error("Max network retries reached, giving up")
+            return False
+        
+        self.logger.warning(f"Network error detected, retrying in {NETWORK_RETRY_DELAY} seconds (attempt {self.network_retries}/{self.max_network_retries})")
+        time.sleep(NETWORK_RETRY_DELAY)
+        return True
+
+    def search_tracks(self, query: str) -> List[str]:
+        self.current_query = query
         self._enforce_rate_limit()
         self._rotate_user_agent()
 
-        try:
-            url = self.config["search"]["search_url"] + query.replace(' ', '+')
-            response = self.session.get(
-                url,
-                timeout=self.config["search"]["timeout"]
-            )
+        for attempt in range(self.config["search"]["max_retries"]):
+            try:
+                if not self._check_network_connection():
+                    if not self._handle_network_error():
+                        return []
+                    continue
 
-            if response.status_code == 429:
+                url = self.config["search"]["search_url"] + query.replace(' ', '+')
+                response = self.session.get(
+                    url,
+                    timeout=self.config["search"]["timeout"]
+                )
+
+                if response.status_code == 429:
+                    self.consecutive_failures += 1
+                    self._record_request(url, False)
+                    self.logger.warning("Rate limit exceeded (429)")
+                    time.sleep(10)  # Longer wait for rate limits
+                    continue
+
+                response.raise_for_status()
+
+                self.consecutive_failures = 0
+                self.network_retries = 0
+                self._record_request(url, True)
+
+                soup = BeautifulSoup(response.text, 'html.parser')
+                links = []
+
+                for a in soup.find_all('a', href=True):
+                    href = a['href']
+                    if href.count('/') == 2 and not href.startswith(('/you/', '/search', '/discover')):
+                        full_url = f"https://soundcloud.com{href}"
+                        if full_url not in links:
+                            links.append(full_url)
+
+                self.logger.debug(f"Found {len(links)} tracks for query: {query}")
+                return links
+
+            except Exception as e:
                 self.consecutive_failures += 1
                 self._record_request(url, False)
-                self.logger.warning("Rate limit exceeded (429)")
-                return []
+                self.logger.error(f"Search error (attempt {attempt + 1}): {e}")
+                time.sleep(RETRY_DELAY * (attempt + 1))
 
-            response.raise_for_status()
-
-            self.consecutive_failures = 0
-            self._record_request(url, True)
-
-            soup = BeautifulSoup(response.text, 'html.parser')
-            links = []
-
-            for a in soup.find_all('a', href=True):
-                href = a['href']
-                if href.count('/') == 2 and not href.startswith(('/you/', '/search', '/discover')):
-                    full_url = f"https://soundcloud.com{href}"
-                    if full_url not in links:
-                        links.append(full_url)
-
-            self.logger.debug(f"Found {len(links)} tracks for query: {query}")
-            return links
-
-        except Exception as e:
-            self.consecutive_failures += 1
-            self._record_request(url, False)
-            self.logger.error(f"Search error: {e}")
-            return []
+        return []
 
     def get_track_info(self, track_url: str) -> Optional[Track]:
         for attempt in range(self.config["search"]["max_retries"]):
             try:
+                if not self._check_network_connection():
+                    if not self._handle_network_error():
+                        return None
+                    continue
+
                 self._enforce_rate_limit()
                 self._rotate_user_agent()
 
@@ -515,6 +568,7 @@ class SoundCloudAPI:
                 track.normalized_title = self._normalize_title(track.title)
 
                 self.consecutive_failures = 0
+                self.network_retries = 0
                 self._record_request(track_url, True)
                 return track
 
@@ -548,9 +602,13 @@ class SoundCloudAPI:
             track.ready = True
             return track
 
-        audio_downloaded = False
         for attempt in range(self.config["search"]["max_retries"]):
             try:
+                if not self._check_network_connection():
+                    if not self._handle_network_error():
+                        return None
+                    continue
+
                 self._enforce_rate_limit()
                 self._rotate_user_agent()
 
@@ -577,10 +635,12 @@ class SoundCloudAPI:
                 )
 
                 if os.path.exists(audio_path):
-                    audio_downloaded = True
                     self.consecutive_failures = 0
+                    self.network_retries = 0
                     self._record_request(track.url, True)
-                    break
+                    track.audio_path = audio_path
+                    track.ready = True
+                    return track
 
             except subprocess.TimeoutExpired as e:
                 self.consecutive_failures += 1
@@ -598,12 +658,7 @@ class SoundCloudAPI:
                 self.logger.warning(f"Download error attempt {attempt + 1}: {e}")
                 time.sleep(RETRY_DELAY * (attempt + 1))
 
-        if not audio_downloaded:
-            return None
-
-        track.audio_path = audio_path
-        track.ready = True
-        return track
+        return None
 
 class AudioStreamer:
     def __init__(self, config: Dict, track_manager: TrackManager, soundcloud: SoundCloudAPI, logger: logging.Logger, json_logger: JsonLogger):
@@ -633,6 +688,10 @@ class AudioStreamer:
         self.volume_change = threading.Event()
         self.new_volume = 80
         self.executor = ThreadPoolExecutor(max_workers=PRELOAD_WORKERS)
+        self.search_timeout = SEARCH_TIMEOUT
+        self.last_successful_search = time.time()
+        self.search_attempts_since_last_success = 0
+        self.max_search_attempts_before_reset = 10
 
     def set_state(self, state: PlayerState) -> None:
         with self.state_lock:
@@ -679,6 +738,9 @@ class AudioStreamer:
         self.control_thread.start()
 
     def stop(self) -> None:
+        if not self.running:
+            return
+
         self.running = False
         self.executor.shutdown(wait=False)
 
@@ -1049,10 +1111,12 @@ class AudioStreamer:
 
             if current_size < refill_threshold:
                 for _ in range(refill_threshold - current_size):
-                    track = self._find_next_track()
+                    track = self._find_next_track_with_fallback()
                     if track:
                         if self.enqueue_track(track):
                             self.logger.info(f"Buffered track: {track.title}")
+                            self.last_successful_search = time.time()
+                            self.search_attempts_since_last_success = 0
                         else:
                             self.logger.warning(f"Failed to enqueue track: {track.title}")
                     else:
@@ -1061,42 +1125,105 @@ class AudioStreamer:
 
             time.sleep(BUFFER_CHECK_INTERVAL)
 
-    def _find_next_track(self) -> Optional[Track]:
-        max_attempts = 5  # Increased for more attempts
+    def _find_next_track_with_fallback(self) -> Optional[Track]:
+        # Try primary search method first
+        track = self._find_next_track()
+        if track:
+            return track
+
+        # If primary search fails, try fallback methods
+        self.logger.warning("Primary search failed, trying fallback methods")
+        
+        # Method 1: Try with expanded queries
+        track = self._find_next_track(use_fallback_queries=True)
+        if track:
+            return track
+
+        # Method 2: Try with relaxed filters
+        track = self._find_next_track(relax_filters=True)
+        if track:
+            return track
+
+        # Method 3: Reset history and try again
+        if self.search_attempts_since_last_success > self.max_search_attempts_before_reset:
+            self.track_manager.reset_history()
+            self.search_attempts_since_last_success = 0
+            track = self._find_next_track()
+            if track:
+                return track
+
+        return None
+
+    def _find_next_track(self, use_fallback_queries: bool = False, relax_filters: bool = False) -> Optional[Track]:
+        max_attempts = 5
+        start_time = time.time()
+        queries = self.config["fallback_queries"] if use_fallback_queries else self.config["queries"]
+        
+        if not queries:
+            self.logger.error("No search queries available")
+            return None
 
         for attempt in range(max_attempts):
-            query = random.choice(self.config["queries"])
-            track_urls = self.soundcloud.search_tracks(query)
-            self.logger.debug(f"Attempt {attempt + 1}: Found {len(track_urls)} URLs for query '{query}'")
+            self.search_attempts_since_last_success += 1
+            
+            # Check if we should reset history
+            if (time.time() - self.last_successful_search > self.search_timeout * 2 and 
+                self.search_attempts_since_last_success > self.max_search_attempts_before_reset):
+                self.logger.warning("Long time without successful search, resetting history")
+                self.track_manager.reset_history()
+                self.last_successful_search = time.time()
+                self.search_attempts_since_last_success = 0
 
-            if not track_urls:
+            query = random.choice(queries)
+            self.logger.debug(f"Attempt {attempt + 1}: Searching with query '{query}' (fallback: {use_fallback_queries}, relaxed: {relax_filters})")
+            
+            try:
+                track_urls = self.soundcloud.search_tracks(query)
+                if not track_urls:
+                    self.logger.debug(f"No URLs found for query '{query}'")
+                    time.sleep(1)
+                    continue
+
+                random.shuffle(track_urls)
+                self.logger.debug(f"Found {len(track_urls)} URLs for query '{query}'")
+
+                for url in track_urls:
+                    if time.time() - start_time > self.search_timeout:
+                        self.logger.warning("Search timeout reached, aborting current search")
+                        break
+
+                    track_info = self.soundcloud.get_track_info(url)
+                    if not track_info:
+                        continue
+
+                    # Apply relaxed filters if requested
+                    if relax_filters:
+                        if track_info.duration < (self.config["player"]["min_duration"] / 2) or track_info.duration > (self.config["player"]["max_duration"] * 2):
+                            self.logger.debug(f"Skipping track {track_info.title}: duration {track_info.duration}s out of relaxed bounds")
+                            continue
+                    else:
+                        if track_info.duration < self.config["player"]["min_duration"] or track_info.duration > self.config["player"]["max_duration"]:
+                            self.logger.debug(f"Skipping track {track_info.title}: duration {track_info.duration}s out of bounds")
+                            continue
+
+                    if not relax_filters and (self.track_manager.is_recent_track(track_info.id) or 
+                                            self.track_manager.is_recent_artist(track_info.artist) or 
+                                            self.track_manager.is_duplicate_title(track_info.title)):
+                        self.logger.debug(f"Skipping track {track_info.title}: recent track/artist or duplicate")
+                        continue
+
+                    if track_info.id in self.queued_ids:
+                        self.logger.debug(f"Skipping track {track_info.title}: already in queue")
+                        continue
+
+                    downloaded_track = self.soundcloud.download_track(track_info)
+                    if downloaded_track and downloaded_track.ready:
+                        self.logger.info(f"Successfully prepared track: {downloaded_track.title}")
+                        return downloaded_track
+
+            except Exception as e:
+                self.logger.error(f"Error during track search: {e}")
                 time.sleep(1)
-                continue
-
-            random.shuffle(track_urls)  # Shuffle to avoid repeating same tracks
-            for url in track_urls:
-                track_info = self.soundcloud.get_track_info(url)
-                if not track_info:
-                    continue
-
-                if track_info.duration < self.config["player"]["min_duration"] or track_info.duration > self.config["player"]["max_duration"]:
-                    self.logger.debug(f"Skipping track {track_info.title}: duration {track_info.duration}s out of bounds")
-                    continue
-
-                if self.track_manager.is_recent_track(track_info.id) or self.track_manager.is_recent_artist(track_info.artist) or self.track_manager.is_duplicate_title(track_info.title):
-                    self.logger.debug(f"Skipping track {track_info.title}: recent track/artist or duplicate")
-                    continue
-
-                if track_info.id in self.queued_ids:
-                    self.logger.debug(f"Skipping track {track_info.title}: already in queue")
-                    continue
-
-                downloaded_track = self.soundcloud.download_track(track_info)
-                if downloaded_track and downloaded_track.ready:
-                    self.logger.info(f"Successfully prepared track: {downloaded_track.title}")
-                    return downloaded_track
-
-            time.sleep(1)
 
         self.logger.warning("No valid track found after max attempts")
         return None
@@ -1107,34 +1234,34 @@ class AudioStreamer:
             self.logger.debug("Stream loop: Buffering state")
 
             try:
-                track = self.track_queue.get(timeout=5)  # Increased timeout
+                track = self.track_queue.get(timeout=5)
                 self.queued_ids.discard(track.id)
                 self.logger.info(f"Dequeued track: {track.title} (ID: {track.id})")
             except queue.Empty:
                 self.logger.warning("Queue empty, attempting to find new track")
-                track = self._find_next_track()
+                track = self._find_next_track_with_fallback()
                 if not track:
                     self.empty_buffer_retries += 1
-                    self.logger.error(f"Failed to find a valid track (retry {self.empty_buffer_retries}/{self.config['player']['max_empty_retries']})")
-                    if self.empty_buffer_retries >= self.config["player"]["max_empty_retries"]:
+                    max_retries = self.config["player"]["max_empty_retries"]
+                    if max_retries != -1 and self.empty_buffer_retries >= max_retries:
                         self.logger.error("Buffer empty after max retries")
                         self.set_state(PlayerState.ERROR)
                         break
+                    self.logger.error(f"Failed to find a valid track (retry {self.empty_buffer_retries}/{max_retries})")
                     time.sleep(self.config["player"]["retry_delay"])
                     continue
 
                 if not self.enqueue_track(track):
                     self.logger.error("Failed to enqueue track")
-                    self.set_state(PlayerState.ERROR)
                     time.sleep(self.config["player"]["retry_delay"])
                     continue
+
                 try:
                     track = self.track_queue.get(timeout=5)
                     self.queued_ids.discard(track.id)
                     self.logger.info(f"Dequeued newly enqueued track: {track.title}")
                 except queue.Empty:
                     self.logger.error("Failed to retrieve enqueued track")
-                    self.set_state(PlayerState.ERROR)
                     time.sleep(self.config["player"]["retry_delay"])
                     continue
 
@@ -1204,7 +1331,7 @@ class HsystRadioPlayer:
         if self.running:
             return
 
-        self.logger.info(f"Starting OPEN Radio v{VERSION}")
+        self.logger.info(f"Starting HSYST Radio v{VERSION}")
         self.running = True
 
         self.track_manager.cleanup_cache()
@@ -1228,13 +1355,13 @@ class HsystRadioPlayer:
         self.logger.info("Stopped")
 
 def main():
-    parser = argparse.ArgumentParser(description=f"OPEN RADIO v{VERSION}")
+    parser = argparse.ArgumentParser(description=f"HSYST RADIO v{VERSION}")
     parser.add_argument('--verbose', action='store_true', help="Verbose logging")
 
     args = parser.parse_args()
 
     if args.verbose:
-        for handler in logging.getLogger("OPENRadio").handlers:
+        for handler in logging.getLogger("HSYSTRadio").handlers:
             if isinstance(handler, logging.StreamHandler):
                 handler.setLevel(logging.DEBUG)
 
