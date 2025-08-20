@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-HSYST Radio Player - Ultra-Optimized Low-Resource Edition (v8.6.0)
+Open Radio Player - Ultra-Optimized Continuous Streaming Edition (v2.0.1)
 ------------------------------------------------------------
-- Complete rewrite of search system with better error handling
-- Added multiple fallback methods for track discovery
-- Improved network resilience with retry strategies
-- Better timeout handling for all operations
-- Enhanced logging for troubleshooting
+- Ensures continuous playback with <1s interruptions
+- Implements emergency buffer with two backup tracks
+- Resets history on prolonged search failures
+- Prioritizes playback, main buffer, then emergency buffer
+- Fixed FFmpeg filter syntax issue
 """
 
 import os
@@ -33,24 +33,26 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 
 # Constants
-VERSION = "8.6.0 Ultra-Resilient"
+VERSION = "9.0.1 Continuous"
 DEFAULT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 MAX_RETRIES = 3
 RETRY_DELAY = 2
-BUFFER_CHECK_INTERVAL = 0.5
+BUFFER_CHECK_INTERVAL = 0.2
+EMERGENCY_CHECK_INTERVAL = 5
 TRANSITION_DURATION = 3
-MIN_BUFFER_SIZE = 1
+MIN_BUFFER_SIZE = 2
 MAX_QUEUE_SIZE = 5
+EMERGENCY_BUFFER_SIZE = 2
 STREAM_TIMEOUT = 30
-PRELOAD_WORKERS = 2
-FFMPEG_MONITOR_INTERVAL = 0.5
+PRELOAD_WORKERS = 3
+FFMPEG_MONITOR_INTERVAL = 0.2
 FFMPEG_RESTART_DELAY = 0
 PLAYBACK_END_MARGIN = 5
 DISCLAIMER_DURATION = 5
 CONTROL_PIPE = "/tmp/hsyst_control_pipe"
 CONTROL_COMMANDS = {"pause", "resume", "skip", "shutdown", "volume_up", "volume_down"}
-SEARCH_TIMEOUT = 20  # Timeout for search operations (seconds)
-NETWORK_RETRY_DELAY = 5  # Delay between network retries
+SEARCH_TIMEOUT = 10  # Max 10s for search to avoid playback gaps
+NETWORK_RETRY_DELAY = 2
 
 # Setup logging
 def setup_logging(base_dir: str) -> logging.Logger:
@@ -105,6 +107,9 @@ class JsonLogger:
     def log_queue(self, queue: List[Dict]) -> None:
         self._write_json_log("upcoming_tracks.json", {"tracks": queue})
 
+    def log_emergency_queue(self, queue: List[Dict]) -> None:
+        self._write_json_log("emergency_tracks.json", {"tracks": queue})
+
     def log_history(self, history: List[Dict]) -> None:
         self._write_json_log("played_tracks.json", {"tracks": history})
 
@@ -152,6 +157,7 @@ DEFAULT_CONFIG = {
         "buffer_size": MIN_BUFFER_SIZE,
         "max_cache_size": 5,
         "track_buffer_size": MAX_QUEUE_SIZE,
+        "emergency_buffer_size": EMERGENCY_BUFFER_SIZE,
         "preload_ahead": 3,
         "control_pipe": CONTROL_PIPE,
     },
@@ -165,8 +171,8 @@ DEFAULT_CONFIG = {
         "preset": "veryfast",
         "threads": 2,
         "keyframe_interval": 60,
-        "rtmp_url": "rtmp://rtmp.livepub.hsyst.xyz/live",
-        "stream_key": "radio",
+        "rtmp_url": "rtmp://SEU_RTMP_AQUI",
+        "stream_key": "KEY_RTMP_AQUI",
     },
     "player": {
         "min_duration": 120,
@@ -174,9 +180,9 @@ DEFAULT_CONFIG = {
         "max_consecutive_artists": 2,
         "artist_cooldown": 5,
         "track_cooldown": 30,
-        "retry_delay": 5,
+        "retry_delay": 1,
         "min_buffer_size": MIN_BUFFER_SIZE,
-        "max_empty_retries": -1,
+        "max_empty_retries": 3,
         "buffer_refill_threshold": 3,
         "ffmpeg_restart_delay": FFMPEG_RESTART_DELAY,
         "playback_end_margin": PLAYBACK_END_MARGIN,
@@ -209,27 +215,26 @@ DEFAULT_CONFIG = {
         "max_retries": 3,
         "user_agent": DEFAULT_USER_AGENT,
         "search_url": "https://soundcloud.com/search/sounds?q=",
-        "timeout": 30,
+        "timeout": SEARCH_TIMEOUT,
         "download_timeout": 200,
-        "request_delay": 20.0,
-        "max_consecutive_failures": 10,
+        "request_delay": 1.0,
+        "max_consecutive_failures": 5,
     },
     "queries": [
-        "Artista1",
-        "Artista2",
-        "Artista3",
-        "Artista4",
-        "Artista5",
-        "Artista6",
-        "etc..."
+        "Chico Buarque",
+        "Os Paralamas do Sucesso",
+        "Mato Seco",
+        "Sublime Band",
+        "Monte Zion",
+        "O Rappa"
     ],
     "fallback_queries": [
-        "Brazilian music",
-        "MPB",
-        "Rock brasileiro",
-        "Sertanejo",
-        "Forró",
-        "Samba"
+        "Chico Buarque",
+        "Os Paralamas do Sucesso",
+        "Mato Seco",
+        "Sublime Band",
+        "Monte Zion",
+        "O Rappa"
     ]
 }
 
@@ -373,11 +378,11 @@ class TrackManager:
             return self.title_stats.get(normalized, 0) > 0
 
     def reset_history(self) -> None:
-        """Reset the play history to allow previously played tracks to be played again"""
         with self.lock:
             self.played_tracks.clear()
             self.last_artists.clear()
-        self.logger.warning("Play history has been reset to expand search results")
+        self.logger.warning("Play history reset to allow track repetition")
+        self.save_data()
 
     def cleanup_cache(self) -> None:
         cache_dir = self.config["system"]["cache_dir"]
@@ -417,7 +422,7 @@ class SoundCloudAPI:
         self.user_agents = self._generate_user_agents()
         self.current_agent_index = 0
         self.network_retries = 0
-        self.max_network_retries = 5
+        self.max_network_retries = 3
 
     def _generate_user_agents(self) -> List[str]:
         return [
@@ -457,7 +462,7 @@ class SoundCloudAPI:
 
     def _check_network_connection(self) -> bool:
         try:
-            response = requests.get("https://www.google.com", timeout=5)
+            response = requests.get("https://www.google.com", timeout=2)
             return response.status_code == 200
         except:
             return False
@@ -465,10 +470,9 @@ class SoundCloudAPI:
     def _handle_network_error(self) -> bool:
         self.network_retries += 1
         if self.network_retries >= self.max_network_retries:
-            self.logger.error("Max network retries reached, giving up")
+            self.logger.error("Max network retries reached")
             return False
-        
-        self.logger.warning(f"Network error detected, retrying in {NETWORK_RETRY_DELAY} seconds (attempt {self.network_retries}/{self.max_network_retries})")
+        self.logger.warning(f"Network error, retrying in {NETWORK_RETRY_DELAY}s (attempt {self.network_retries}/{self.max_network_retries})")
         time.sleep(NETWORK_RETRY_DELAY)
         return True
 
@@ -494,7 +498,7 @@ class SoundCloudAPI:
                     self.consecutive_failures += 1
                     self._record_request(url, False)
                     self.logger.warning("Rate limit exceeded (429)")
-                    time.sleep(10)  # Longer wait for rate limits
+                    time.sleep(2)
                     continue
 
                 response.raise_for_status()
@@ -673,12 +677,15 @@ class AudioStreamer:
         self.next_track = None
         self.previous_track = None
         self.track_queue = queue.Queue(maxsize=self.config["system"]["track_buffer_size"])
+        self.emergency_queue = queue.Queue(maxsize=self.config["system"]["emergency_buffer_size"])
         self.queued_ids: Set[str] = set()
+        self.emergency_ids: Set[str] = set()
         self.state = PlayerState.IDLE
         self.state_lock = threading.Lock()
         self.empty_buffer_retries = 0
         self.stream_thread = None
         self.buffer_thread = None
+        self.emergency_buffer_thread = None
         self.control_thread = None
         self.volume = self.config["player"]["volume"]
         self.skip_requested = threading.Event()
@@ -691,7 +698,7 @@ class AudioStreamer:
         self.search_timeout = SEARCH_TIMEOUT
         self.last_successful_search = time.time()
         self.search_attempts_since_last_success = 0
-        self.max_search_attempts_before_reset = 10
+        self.max_search_attempts_before_reset = 5
 
     def set_state(self, state: PlayerState) -> None:
         with self.state_lock:
@@ -709,6 +716,7 @@ class AudioStreamer:
             "next_track": self.next_track.to_dict() if self.next_track else None,
             "previous_track": self.previous_track.to_dict() if self.previous_track else None,
             "queue_size": self.track_queue.qsize(),
+            "emergency_queue_size": self.emergency_queue.qsize(),
             "volume": self.volume,
             "timestamp": datetime.now().isoformat()
         }
@@ -719,22 +727,16 @@ class AudioStreamer:
             return
 
         self.running = True
-        self.stream_thread = threading.Thread(
-            target=self._stream_loop,
-            daemon=True
-        )
+        self.stream_thread = threading.Thread(target=self._stream_loop, daemon=True)
         self.stream_thread.start()
 
-        self.buffer_thread = threading.Thread(
-            target=self._buffer_loop,
-            daemon=True
-        )
+        self.buffer_thread = threading.Thread(target=self._buffer_loop, daemon=True)
         self.buffer_thread.start()
 
-        self.control_thread = threading.Thread(
-            target=self._watch_control_pipe,
-            daemon=True
-        )
+        self.emergency_buffer_thread = threading.Thread(target=self._emergency_buffer_loop, daemon=True)
+        self.emergency_buffer_thread.start()
+
+        self.control_thread = threading.Thread(target=self._watch_control_pipe, daemon=True)
         self.control_thread.start()
 
     def stop(self) -> None:
@@ -748,6 +750,8 @@ class AudioStreamer:
             self.stream_thread.join(timeout=2)
         if self.buffer_thread:
             self.buffer_thread.join(timeout=2)
+        if self.emergency_buffer_thread:
+            self.emergency_buffer_thread.join(timeout=2)
         if self.control_thread:
             self.control_thread.join(timeout=2)
 
@@ -805,6 +809,14 @@ class AudioStreamer:
         elif command == "shutdown":
             self.shutdown_requested.set()
 
+    def _delete_emergency_track(self, track: Track) -> None:
+        if track and track.audio_path and os.path.exists(track.audio_path):
+            try:
+                os.remove(track.audio_path)
+                self.logger.info(f"Deleted emergency track audio file: {track.audio_path}")
+            except Exception as e:
+                self.logger.error(f"Error deleting emergency track audio file {track.audio_path}: {e}")
+
     def enqueue_track(self, track: Track) -> bool:
         if not track or not track.ready or not os.path.exists(track.audio_path):
             self.logger.warning(f"Cannot enqueue invalid track: {track}")
@@ -822,10 +834,47 @@ class AudioStreamer:
             self._update_status_log()
             return True
         except queue.Full:
-            self.logger.warning("Queue full, cannot enqueue track")
+            self.logger.warning("Main queue full, cannot enqueue track")
             return False
         except Exception as e:
             self.logger.error(f"Error enqueueing: {e}")
+            return False
+
+    def enqueue_emergency_track(self, track: Track) -> bool:
+        if not track or not track.ready or not os.path.exists(track.audio_path):
+            self.logger.warning(f"Cannot enqueue invalid emergency track: {track}")
+            return False
+
+        if track.id in self.emergency_ids:
+            self.logger.debug(f"Skipping duplicate track in emergency queue: {track.id}")
+            return False
+
+        try:
+            self.emergency_queue.put(track, timeout=1)
+            self.emergency_ids.add(track.id)
+            self.logger.debug(f"Enqueued emergency track: {track.title} (ID: {track.id})")
+            self._update_emergency_queue_log()
+            self._update_status_log()
+            return True
+        except queue.Full:
+            try:
+                old_track = self.emergency_queue.get_nowait()
+                self.emergency_ids.discard(old_track.id)
+                self._delete_emergency_track(old_track)
+                self.emergency_queue.put(track, timeout=1)
+                self.emergency_ids.add(track.id)
+                self.logger.debug(f"Replaced emergency track: {track.title} (ID: {track.id})")
+                self._update_emergency_queue_log()
+                self._update_status_log()
+                return True
+            except queue.Empty:
+                self.logger.warning("Emergency queue empty after full")
+                return False
+            except Exception as e:
+                self.logger.error(f"Error replacing emergency track: {e}")
+                return False
+        except Exception as e:
+            self.logger.error(f"Error enqueueing emergency track: {e}")
             return False
 
     def _update_queue_log(self) -> None:
@@ -841,6 +890,20 @@ class AudioStreamer:
             self.track_queue.put(temp_queue.get_nowait())
 
         self.json_logger.log_queue(queue_list)
+
+    def _update_emergency_queue_log(self) -> None:
+        queue_list = []
+        temp_queue = queue.Queue()
+
+        while not self.emergency_queue.empty():
+            track = self.emergency_queue.get_nowait()
+            queue_list.append(track.to_dict())
+            temp_queue.put(track)
+
+        while not temp_queue.empty():
+            self.emergency_queue.put(temp_queue.get_nowait())
+
+        self.json_logger.log_emergency_queue(queue_list)
 
     def _get_rtmp_url(self) -> str:
         rtmp_url = self.config["stream"]["rtmp_url"]
@@ -906,7 +969,7 @@ class AudioStreamer:
 
             threading.Thread(target=log_ffmpeg_output, daemon=True).start()
 
-            time.sleep(0.5)
+            time.sleep(0.2)
             if self.stream_process.poll() is None:
                 return True
             else:
@@ -920,7 +983,7 @@ class AudioStreamer:
         if self.stream_process:
             try:
                 self.stream_process.terminate()
-                self.stream_process.wait(timeout=3)
+                self.stream_process.wait(timeout=2)
             except:
                 self.stream_process.kill()
                 self.stream_process.wait()
@@ -1039,21 +1102,19 @@ class AudioStreamer:
 
         disclaimer_fade_in = f"if(lt(t,{transition_duration}),t/{transition_duration},1)"
         disclaimer_fade_out = f"if(gt(t,{disclaimer_duration}-{transition_duration}),({disclaimer_duration}-t)/{transition_duration},1)"
-
         main_fade_in = f"if(lt(t,{disclaimer_duration}+{transition_duration}),(t-{disclaimer_duration})/{transition_duration},1)"
         main_fade_out = f"if(gt(t,{track.duration}-{transition_duration}),({track.duration}-t)/{transition_duration},1)"
 
         filters = [
-            f"[1:v]format=yuv420p[bg];"
+            f"[1:v]format=yuv420p[bg];",
             f"[bg]drawtext=text='{disclaimer}':"
             f"fontfile='{font_file}':"
-            f"fontcolor=white:"
+            f"fontcolor={self.config['visuals']['text_color']}:"
             f"fontsize={self.config['visuals']['font_size_info']}:"
             f"x=(w-text_w)/2:y=(h-text_h)/2:"
-            f"box=1:boxcolor=black@0.8:boxborderw={box_border}:"
+            f"box=1:boxcolor=black@{box_opacity}:boxborderw={box_border}:"
             f"alpha='{disclaimer_fade_in}*{disclaimer_fade_out}':"
-            f"enable='between(t,0,{disclaimer_duration})'[dis];"
-
+            f"enable='between(t,0,{disclaimer_duration})'[dis];",
             f"[dis]drawtext=text='{title}':"
             f"fontfile='{font_file}':"
             f"fontcolor={self.config['visuals']['text_color']}:"
@@ -1061,8 +1122,7 @@ class AudioStreamer:
             f"x={margin}:y=h-text_h-{margin}:"
             f"box=1:boxcolor=black@{box_opacity}:boxborderw={box_border}:"
             f"alpha='{main_fade_in}*{main_fade_out}':"
-            f"enable='gt(t,{disclaimer_duration})'[title];"
-
+            f"enable='gt(t,{disclaimer_duration})'[title];",
             f"[title]drawtext=text='{artist}':"
             f"fontfile='{font_file}':"
             f"fontcolor={self.config['visuals']['highlight_color']}:"
@@ -1070,8 +1130,7 @@ class AudioStreamer:
             f"x={margin}:y=h-text_h-{margin}-{self.config['visuals']['font_size_title']}-30:"
             f"box=1:boxcolor=black@{box_opacity}:boxborderw={box_border}:"
             f"alpha='{main_fade_in}*{main_fade_out}':"
-            f"enable='gt(t,{disclaimer_duration})'[artist];"
-
+            f"enable='gt(t,{disclaimer_duration})'[artist];",
             f"[artist]drawtext=text='{self.config['visuals']['logo_text']}':"
             f"fontfile='{font_file}':"
             f"fontcolor={self.config['visuals']['highlight_color']}:"
@@ -1079,17 +1138,15 @@ class AudioStreamer:
             f"x=w-text_w-{margin}:y=h-text_h-{margin}:"
             f"box=1:boxcolor=black@{box_opacity}:boxborderw={box_border}:"
             f"alpha='{main_fade_in}*{main_fade_out}':"
-            f"enable='gt(t,{disclaimer_duration})'[logo];"
-
+            f"enable='gt(t,{disclaimer_duration})'[logo];",
             f"[logo]drawtext=text='{self.config['visuals']['credits_text']}':"
             f"fontfile='{font_file}':"
-            f"fontcolor=white:"
+            f"fontcolor={self.config['visuals']['text_color']}:"
             f"fontsize={self.config['visuals']['font_size_info']}:"
             f"x={margin}:y={margin}:"
             f"box=1:boxcolor=black@{box_opacity}:boxborderw={box_border}:"
             f"alpha='{main_fade_in}*{main_fade_out}':"
-            f"enable='gt(t,{disclaimer_duration})'[credits];"
-
+            f"enable='gt(t,{disclaimer_duration})'[credits];",
             f"[credits]drawtext=text='{self.config['visuals']['live_indicator']}':"
             f"fontfile='{font_file}':"
             f"fontcolor=red:fontsize=36:"
@@ -1111,41 +1168,57 @@ class AudioStreamer:
 
             if current_size < refill_threshold:
                 for _ in range(refill_threshold - current_size):
+                    start_time = time.time()
                     track = self._find_next_track_with_fallback()
-                    if track:
-                        if self.enqueue_track(track):
-                            self.logger.info(f"Buffered track: {track.title}")
-                            self.last_successful_search = time.time()
-                            self.search_attempts_since_last_success = 0
-                        else:
-                            self.logger.warning(f"Failed to enqueue track: {track.title}")
+                    if track and self.enqueue_track(track):
+                        self.logger.info(f"Buffered track: {track.title}")
+                        self.last_successful_search = time.time()
+                        self.search_attempts_since_last_success = 0
                     else:
                         self.logger.warning("No valid track found for buffering")
-                        time.sleep(1)
+                        if time.time() - start_time > self.search_timeout:
+                            self.logger.warning("Search took too long, resetting history")
+                            self.track_manager.reset_history()
+                        time.sleep(0.2)
 
             time.sleep(BUFFER_CHECK_INTERVAL)
 
+    def _emergency_buffer_loop(self) -> None:
+        while self.running:
+            current_size = self.emergency_queue.qsize()
+            self.logger.debug(f"Emergency buffer loop: queue size = {current_size}")
+
+            if current_size < self.config["system"]["emergency_buffer_size"]:
+                start_time = time.time()
+                track = self._find_next_track(relax_filters=True)
+                if track and self.enqueue_emergency_track(track):
+                    self.logger.info(f"Buffered emergency track: {track.title}")
+                else:
+                    self.logger.warning("No valid track found for emergency buffer")
+                    if time.time() - start_time > self.search_timeout:
+                        self.logger.warning("Emergency search took too long, resetting history")
+                        self.track_manager.reset_history()
+                time.sleep(EMERGENCY_CHECK_INTERVAL)
+            else:
+                time.sleep(EMERGENCY_CHECK_INTERVAL)
+
     def _find_next_track_with_fallback(self) -> Optional[Track]:
-        # Try primary search method first
         track = self._find_next_track()
         if track:
             return track
 
-        # If primary search fails, try fallback methods
         self.logger.warning("Primary search failed, trying fallback methods")
         
-        # Method 1: Try with expanded queries
         track = self._find_next_track(use_fallback_queries=True)
         if track:
             return track
 
-        # Method 2: Try with relaxed filters
         track = self._find_next_track(relax_filters=True)
         if track:
             return track
 
-        # Method 3: Reset history and try again
         if self.search_attempts_since_last_success > self.max_search_attempts_before_reset:
+            self.logger.warning("Max search attempts reached, resetting history")
             self.track_manager.reset_history()
             self.search_attempts_since_last_success = 0
             track = self._find_next_track()
@@ -1155,7 +1228,7 @@ class AudioStreamer:
         return None
 
     def _find_next_track(self, use_fallback_queries: bool = False, relax_filters: bool = False) -> Optional[Track]:
-        max_attempts = 5
+        max_attempts = 3
         start_time = time.time()
         queries = self.config["fallback_queries"] if use_fallback_queries else self.config["queries"]
         
@@ -1166,10 +1239,9 @@ class AudioStreamer:
         for attempt in range(max_attempts):
             self.search_attempts_since_last_success += 1
             
-            # Check if we should reset history
-            if (time.time() - self.last_successful_search > self.search_timeout * 2 and 
+            if (time.time() - self.last_successful_search > self.search_timeout and 
                 self.search_attempts_since_last_success > self.max_search_attempts_before_reset):
-                self.logger.warning("Long time without successful search, resetting history")
+                self.logger.warning("Search timeout exceeded, resetting history")
                 self.track_manager.reset_history()
                 self.last_successful_search = time.time()
                 self.search_attempts_since_last_success = 0
@@ -1181,7 +1253,7 @@ class AudioStreamer:
                 track_urls = self.soundcloud.search_tracks(query)
                 if not track_urls:
                     self.logger.debug(f"No URLs found for query '{query}'")
-                    time.sleep(1)
+                    time.sleep(0.2)
                     continue
 
                 random.shuffle(track_urls)
@@ -1189,14 +1261,13 @@ class AudioStreamer:
 
                 for url in track_urls:
                     if time.time() - start_time > self.search_timeout:
-                        self.logger.warning("Search timeout reached, aborting current search")
+                        self.logger.warning("Search timeout reached, aborting")
                         break
 
                     track_info = self.soundcloud.get_track_info(url)
                     if not track_info:
                         continue
 
-                    # Apply relaxed filters if requested
                     if relax_filters:
                         if track_info.duration < (self.config["player"]["min_duration"] / 2) or track_info.duration > (self.config["player"]["max_duration"] * 2):
                             self.logger.debug(f"Skipping track {track_info.title}: duration {track_info.duration}s out of relaxed bounds")
@@ -1212,7 +1283,7 @@ class AudioStreamer:
                         self.logger.debug(f"Skipping track {track_info.title}: recent track/artist or duplicate")
                         continue
 
-                    if track_info.id in self.queued_ids:
+                    if track_info.id in self.queued_ids or track_info.id in self.emergency_ids:
                         self.logger.debug(f"Skipping track {track_info.title}: already in queue")
                         continue
 
@@ -1223,7 +1294,7 @@ class AudioStreamer:
 
             except Exception as e:
                 self.logger.error(f"Error during track search: {e}")
-                time.sleep(1)
+                time.sleep(0.2)
 
         self.logger.warning("No valid track found after max attempts")
         return None
@@ -1234,68 +1305,79 @@ class AudioStreamer:
             self.logger.debug("Stream loop: Buffering state")
 
             try:
-                track = self.track_queue.get(timeout=5)
-                self.queued_ids.discard(track.id)
-                self.logger.info(f"Dequeued track: {track.title} (ID: {track.id})")
-            except queue.Empty:
-                self.logger.warning("Queue empty, attempting to find new track")
-                track = self._find_next_track_with_fallback()
-                if not track:
-                    self.empty_buffer_retries += 1
-                    max_retries = self.config["player"]["max_empty_retries"]
-                    if max_retries != -1 and self.empty_buffer_retries >= max_retries:
-                        self.logger.error("Buffer empty after max retries")
-                        self.set_state(PlayerState.ERROR)
-                        break
-                    self.logger.error(f"Failed to find a valid track (retry {self.empty_buffer_retries}/{max_retries})")
-                    time.sleep(self.config["player"]["retry_delay"])
-                    continue
+                start_time = time.time()
+                try:
+                    track = self.track_queue.get(timeout=self.search_timeout)
+                    self.queued_ids.discard(track.id)
+                    self.logger.info(f"Dequeued track: {track.title} (ID: {track.id})")
+                except queue.Empty:
+                    self.logger.warning("Main queue empty, attempting emergency queue")
+                    try:
+                        track = self.emergency_queue.get_nowait()
+                        self.emergency_ids.discard(track.id)
+                        self.logger.info(f"Dequeued emergency track: {track.title} (ID: {track.id})")
+                        self.track_manager.add_played_track(track)
+                    except queue.Empty:
+                        self.logger.warning("Emergency queue empty, attempting immediate search")
+                        track = self._find_next_track_with_fallback()
+                        if not track:
+                            self.empty_buffer_retries += 1
+                            max_retries = self.config["player"]["max_empty_retries"]
+                            if max_retries != -1 and self.empty_buffer_retries >= max_retries:
+                                self.logger.error("All buffers empty after max retries")
+                                self.set_state(PlayerState.ERROR)
+                                break
+                            self.logger.error(f"Failed to find track (retry {self.empty_buffer_retries}/{max_retries})")
+                            time.sleep(self.config["player"]["retry_delay"])
+                            continue
+                        if not self.enqueue_track(track):
+                            self.logger.error("Failed to enqueue immediate track")
+                            time.sleep(self.config["player"]["retry_delay"])
+                            continue
+                        track = self.track_queue.get(timeout=self.search_timeout)
+                        self.queued_ids.discard(track.id)
 
-                if not self.enqueue_track(track):
-                    self.logger.error("Failed to enqueue track")
-                    time.sleep(self.config["player"]["retry_delay"])
-                    continue
+                if time.time() - start_time > self.search_timeout:
+                    self.logger.warning("Track retrieval took too long, resetting history")
+                    self.track_manager.reset_history()
 
                 try:
-                    track = self.track_queue.get(timeout=5)
-                    self.queued_ids.discard(track.id)
-                    self.logger.info(f"Dequeued newly enqueued track: {track.title}")
-                except queue.Empty:
-                    self.logger.error("Failed to retrieve enqueued track")
-                    time.sleep(self.config["player"]["retry_delay"])
-                    continue
+                    self._delete_previous_track()
+                    self.previous_track = self.current_track
+                    self.current_track = track
+                    self.track_manager.add_played_track(self.current_track)
+                    self.logger.info(f"Playing: {self.current_track.title} by {self.current_track.artist}")
 
-            try:
-                self._delete_previous_track()
-                self.previous_track = self.current_track
-                self.current_track = track
-                self.track_manager.add_played_track(self.current_track)
-                self.logger.info(f"Playing: {self.current_track.title} by {self.current_track.artist}")
+                    self.json_logger.log_current_track(self.current_track.to_dict())
+                    if self.previous_track:
+                        self.json_logger.log_previous_track(self.previous_track.to_dict())
+                    self._update_status_log()
 
-                self.json_logger.log_current_track(self.current_track.to_dict())
-                if self.previous_track:
-                    self.json_logger.log_previous_track(self.previous_track.to_dict())
-                self._update_status_log()
+                    success = self._stream_track(self.current_track)
 
-                success = self._stream_track(self.current_track)
+                    if not success:
+                        self.set_state(PlayerState.ERROR)
+                        self.logger.error(f"Failed to stream track: {self.current_track.title}")
+                        time.sleep(self.config["player"]["retry_delay"])
+                        continue
 
-                if not success:
+                    self.empty_buffer_retries = 0
+                    self.previous_track = self.current_track
+                    self.current_track = None
+
+                    if self.previous_track:
+                        self.json_logger.log_previous_track(self.previous_track.to_dict())
+                    self.json_logger.log_current_track({})
+                    self._update_status_log()
+
+                except Exception as e:
+                    self.logger.error(f"Stream loop error: {e}")
                     self.set_state(PlayerState.ERROR)
-                    self.logger.error(f"Failed to stream track: {self.current_track.title}")
                     time.sleep(self.config["player"]["retry_delay"])
                     continue
-
-                self.empty_buffer_retries = 0
-                self.previous_track = self.current_track
-                self.current_track = None
-
-                if self.previous_track:
-                    self.json_logger.log_previous_track(self.previous_track.to_dict())
-                self.json_logger.log_current_track({})
-                self._update_status_log()
 
             except Exception as e:
-                self.logger.error(f"Stream loop error: {e}")
+                self.logger.error(f"Unexpected stream loop error: {e}")
                 self.set_state(PlayerState.ERROR)
                 time.sleep(self.config["player"]["retry_delay"])
                 continue
